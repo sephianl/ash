@@ -10,6 +10,9 @@ defmodule Ash.Test.Actions.BulkUpdateTest do
   require Ash.Query
   import Ash.Expr
 
+  require Ash.Query
+  import Ash.Expr
+
   alias Ash.Test.Domain, as: Domain
 
   defmodule Notifier do

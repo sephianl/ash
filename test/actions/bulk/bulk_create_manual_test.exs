@@ -231,7 +231,7 @@ defmodule Ash.Test.Actions.BulkCreateManualTest do
       create_ctx = Helpers.build_create_ctx(ctx)
 
       Enum.reduce(changesets, [], fn changeset, results ->
-        # Trigger a nested bulk_create to test context collision prevention
+        # Trigger a nested bulk_create to test context collision
         Ash.bulk_create!(
           [%{name: "nested"}],
           Ash.Test.Actions.BulkCreateManualTest.Author,
@@ -534,7 +534,7 @@ defmodule Ash.Test.Actions.BulkCreateManualTest do
     assert result.error_count == 1
   end
 
-  test "bulk_create manual action with nested bulk operation causes context collision" do
+  test "bulk_create manual action with nested bulk operation" do
     result =
       [%{name: "Author1"}, %{name: "Author2"}]
       |> Ash.bulk_create(Author, :create_manual_with_nested,
@@ -543,7 +543,7 @@ defmodule Ash.Test.Actions.BulkCreateManualTest do
         return_notifications?: false
       )
 
-    # This test should fail due to context collision in the current implementation
+    # This test may fail due to context collision between nested bulk operations
     assert Enum.count(result.records) == 2
     assert result.error_count == 0
   end
