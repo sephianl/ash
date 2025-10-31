@@ -660,7 +660,11 @@ defmodule Ash.Actions.Update.Bulk do
             case results do
               [result] ->
                 if atomic_changeset.context[:data_layer][:use_atomic_update_data?] do
-                  Map.put(result, :__metadata__, atomic_changeset.data.__metadata__)
+                  Map.put(
+                    result,
+                    :__metadata__,
+                    Map.merge(atomic_changeset.data.__metadata__, result.__metadata__)
+                  )
                 else
                   [result]
                 end
@@ -2594,7 +2598,6 @@ defmodule Ash.Actions.Update.Bulk do
                     ref,
                     opts
                   )
-                  |> add_metadata_to_results(batch, metadata_key, ref_metadata_key, context_key)
 
                 _ ->
                   Enum.reduce_while(
@@ -2730,8 +2733,16 @@ defmodule Ash.Actions.Update.Bulk do
                 store_error(ref, error, opts)
                 []
 
-              {:ok, result, _changeset, %{notifications: more_new_notifications}} ->
+              {:ok, result_after_action, _changeset, %{notifications: more_new_notifications}} ->
                 store_notification(ref, more_new_notifications, opts)
+
+                result =
+                  Map.put(
+                    result_after_action,
+                    :__metadata__,
+                    Map.merge(result_after_action.__metadata__, result.__metadata__)
+                  )
+
                 [result]
             end
 
@@ -3538,34 +3549,13 @@ defmodule Ash.Actions.Update.Bulk do
     end
   end
 
-  defp find_changeset_by_index(result, changesets_by_ref, metadata_key) do
-    changesets_by_ref[result.__metadata__[metadata_key]]
-  end
-
   defp find_changeset(result, changesets_by_ref, _metadata_key, ref_metadata_key)
        when not is_nil(ref_metadata_key) do
     find_changeset_by_ref(result, changesets_by_ref, ref_metadata_key)
   end
 
   defp find_changeset(result, changesets_by_ref, metadata_key, nil) do
-    find_changeset_by_index(result, changesets_by_ref, metadata_key)
-  end
-
-  defp add_metadata_to_results({:ok, results}, batch, metadata_key, ref_metadata_key, context_key) do
-    results_with_metadata =
-      results
-      |> Enum.zip(batch)
-      |> Enum.map(fn {result, changeset} ->
-        result
-        |> Ash.Resource.put_metadata(metadata_key, changeset.context[context_key].index)
-        |> Ash.Resource.put_metadata(ref_metadata_key, changeset.context[context_key].ref)
-      end)
-
-    {:ok, results_with_metadata}
-  end
-
-  defp add_metadata_to_results(other, _batch, _metadata_key, _ref_metadata_key, _context_key) do
-    other
+    find_changeset_by_ref(result, changesets_by_ref, metadata_key)
   end
 
   defp ensure_changeset!(nil, _result, _metadata_key, ref_metadata_key) do
@@ -3580,15 +3570,11 @@ defmodule Ash.Actions.Update.Bulk do
     if ref_metadata_key do
       ref_key = result.__metadata__[ref_metadata_key]
 
-      if ref_key do
-        ref_key in List.wrap(changes)
-      else
-        # Fallback: find if this record ID has a changeset with ref in changes
-        Enum.any?(changesets_by_ref, fn {changeset_ref, changeset} ->
-          Map.get(changeset.data, :id) == result.id and
-            changeset_ref in List.wrap(changes)
-        end)
-      end
+      changesets_by_ref
+      |> Map.get(ref_key)
+      |> ensure_changeset!(result, metadata_key, ref_metadata_key)
+
+      ref_key in List.wrap(changes)
     else
       result.__metadata__[metadata_key] in List.wrap(changes)
     end
