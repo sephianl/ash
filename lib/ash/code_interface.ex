@@ -256,6 +256,154 @@ defmodule Ash.CodeInterface do
     end
   end
 
+  @doc """
+  Resolves the subject (ActionInput) for a generic action.
+
+  Handles validation, domain setting, and error accumulation for ActionInput subjects.
+
+  ## Parameters
+  - `input` - Map with `:opts` key containing keyword list
+  - `params` - Action parameters
+  - `custom_input_errors` - Accumulated custom validation errors
+  - `resource` - The Ash resource module
+  - `domain` - The Ash domain module
+  - `action_name` - Name of the action to invoke
+
+  ## Returns
+  `{resolved_input, opts}` where:
+  - `resolved_input` is an `%Ash.ActionInput{}` struct
+  - `opts` is remaining options after extracting input-specific opts
+  """
+  def resolve_action_subject_for_action(
+        input,
+        params,
+        custom_input_errors,
+        resource,
+        domain,
+        action_name
+      ) do
+    {input_opts, opts} =
+      Keyword.split(input[:opts] || [], [
+        :input,
+        :actor,
+        :tenant,
+        :authorize?,
+        :tracer,
+        :scope,
+        :private_arguments
+      ])
+
+    {input_val, input_opts} = Keyword.pop(input_opts, :input)
+
+    input_opts = Keyword.put(input_opts, :domain, domain)
+
+    case input_val do
+      %Ash.ActionInput{resource: ^resource} ->
+        input_val
+
+      %Ash.ActionInput{resource: other_resource} ->
+        raise ArgumentError,
+              "Action input resource #{inspect(other_resource)} does not match expected resource #{inspect(resource)}."
+
+      _ ->
+        input_val
+    end
+
+    resolved_input =
+      (input_val || resource)
+      |> Ash.ActionInput.for_action(action_name, params, input_opts)
+      |> Ash.ActionInput.add_error(custom_input_errors)
+
+    {resolved_input, opts}
+  end
+
+  @doc """
+  Resolves the subject (Query) for a read action.
+
+  Handles query building, filter application, and validation for read operations.
+
+  ## Parameters
+  - `query_input` - Map with `:opts` key containing keyword list
+  - `params` - Action parameters
+  - `custom_input_errors` - Accumulated custom validation errors
+  - `filter_params` - Filter parameters to apply to the query
+  - `resource` - The Ash resource module
+  - `domain` - The Ash domain module
+  - `action_name` - Name of the read action
+  - `filter_keys` - List of filter keys to apply
+
+  ## Returns
+  `{query, opts}` where:
+  - `query` is an `%Ash.Query{}` struct with filters and action applied
+  - `opts` is remaining options after extracting query-specific opts
+  """
+  def resolve_action_subject_for_read(
+        query_input,
+        params,
+        custom_input_errors,
+        filter_params,
+        resource,
+        domain,
+        action_name,
+        filter_keys
+      ) do
+    {query_opts, opts} =
+      Keyword.split(query_input[:opts] || [], [
+        :query,
+        :actor,
+        :tenant,
+        :authorize?,
+        :tracer,
+        :context,
+        :scope,
+        :load
+      ])
+
+    {query_val, query_opts} = Keyword.pop(query_opts, :query)
+
+    query_opts = Keyword.put(query_opts, :domain, domain)
+
+    opts = if query_opts[:load], do: Keyword.put(opts, :load, query_opts[:load]), else: opts
+
+    query =
+      case query_val do
+        %Ash.Query{resource: ^resource} = query ->
+          query
+
+        %Ash.Query{resource: other_resource} ->
+          raise ArgumentError,
+                "Query resource #{inspect(other_resource)} does not match expected resource #{inspect(resource)}."
+
+        ^resource ->
+          resource
+          |> Ash.Query.new()
+
+        other_resource
+        when is_atom(other_resource) and not is_nil(other_resource) ->
+          raise ArgumentError,
+                "Query resource #{inspect(other_resource)} does not match expected resource #{inspect(resource)}."
+
+        query ->
+          Ash.Query.build(resource, query || [])
+      end
+      |> Ash.Query.add_error(custom_input_errors)
+
+
+    query =
+      if filter_keys && !Enum.empty?(filter_keys) do
+        require Ash.Query
+
+        query
+        |> Ash.Query.for_read(action_name, params, query_opts)
+        |> Ash.Query.do_filter(filter_params)
+      else
+        Ash.Query.for_read(query, action_name, params, query_opts)
+      end
+      |> Ash.Query.add_error(custom_input_errors)
+
+    {query, opts}
+  end
+
   @doc false
   # sobelow_skip ["DOS.BinToAtom", "DOS.StringToAtom"]
   def resolve_calc_method_names(name) do
