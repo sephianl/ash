@@ -203,6 +203,60 @@ defmodule Ash.CodeInterface do
   end
 
   @doc false
+  def execute_action_with_result_handling(subject, opts, raise_on_error?, executor_fn) do
+    result = executor_fn.(subject, opts)
+
+    if raise_on_error? do
+      case result do
+        {:ok, val} -> val
+        {:error, error} -> raise Ash.Error.to_error_class(error)
+        %Ash.BulkResult{} = bulk -> bulk
+        other -> other
+      end
+    else
+      result
+    end
+  end
+
+  @doc false
+  def handle_params_and_opts_for_create(params, opts) do
+    if params == [] and opts == nil do
+      raise ArgumentError, """
+      Cannot provide an empty list for params without also specifying options.
+
+      We cannot tell the difference between an empty list of inputs and an empty list of options.
+
+      If you are trying to provide an empty list of options,
+      you should also specify empty `params`, i.e `function(..., %{}, params)`
+
+      If you are trying to provide an empty list of records to create,
+      you should also specify empty `opts`, i.e `function(..., params, [])`
+      """
+    else
+      if Keyword.keyword?(params) and is_nil(opts) do
+        {%{}, params}
+      else
+        {params || %{}, opts || []}
+      end
+    end
+  end
+
+  @doc false
+  def handle_params_and_opts(params, opts) do
+    keyword? = Keyword.keyword?(params)
+
+    if keyword? and is_nil(opts) do
+      {%{}, params}
+    else
+      if keyword? do
+        {Map.new(params), opts || []}
+      else
+        {params || %{}, opts || []}
+      end
+    end
+  end
+
+  @doc false
   # sobelow_skip ["DOS.BinToAtom", "DOS.StringToAtom"]
   def resolve_calc_method_names(name) do
     if name |> to_string() |> String.ends_with?("?") do
