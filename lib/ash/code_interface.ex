@@ -661,6 +661,468 @@ defmodule Ash.CodeInterface do
     {changeset, changeset_opts, opts}
   end
 
+  @doc """
+  Executes a create action, handling both single-record and bulk create operations.
+
+  This function is called at runtime by generated code interface functions. It handles:
+  - Single record creation via `Ash.create/2` or `Ash.create!/2`
+  - Bulk creation via `Ash.bulk_create/4` or `Ash.bulk_create!/4`
+  - Error handling based on `raise_on_error?` flag
+  - Custom input validation and errors
+
+  ## Parameters
+  - `changeset` - Either an `%Ash.Changeset{}` or `{:bulk, inputs}` tuple
+  - `custom_input_errors` - List of custom validation errors from input processing
+  - `changeset_opts` - Options to pass to changeset creation (actor, tenant, etc.)
+  - `opts` - Additional options including `:bulk_options`
+  - `resource` - The Ash resource module
+  - `action_name` - Name of the create action to invoke
+  - `raise_on_error?` - If true, raises on error; if false, returns `{:ok, result}` tuples
+
+  ## Returns
+  - When `raise_on_error?` is false: `{:ok, record}`, `{:error, error}`, or `%Ash.BulkResult{}`
+  - When `raise_on_error?` is true: `record`, `%Ash.BulkResult{}`, or raises exception
+  """
+  def execute_create_action(
+        changeset,
+        custom_input_errors,
+        changeset_opts,
+        opts,
+        resource,
+        action_name,
+        raise_on_error?
+      ) do
+    case changeset do
+      {:bulk, inputs} ->
+        if Enum.any?(custom_input_errors) do
+          if raise_on_error? do
+            raise Ash.Error.to_error_class(custom_input_errors)
+          else
+            %Ash.BulkResult{
+              errors: [Ash.Error.to_error_class(custom_input_errors)],
+              error_count: 1
+            }
+          end
+        else
+          bulk_opts =
+            opts
+            |> Keyword.delete(:bulk_options)
+            |> Keyword.put(:notify?, true)
+            |> Keyword.merge(Keyword.get(opts, :bulk_options, []))
+            |> Enum.concat(changeset_opts)
+
+          if raise_on_error? do
+            Ash.bulk_create!(inputs, resource, action_name, bulk_opts)
+          else
+            Ash.bulk_create(inputs, resource, action_name, bulk_opts)
+          end
+        end
+
+      changeset ->
+        cleaned_opts = Keyword.delete(opts, :bulk_options)
+
+        if raise_on_error? do
+          Ash.create!(changeset, cleaned_opts)
+        else
+          Ash.create(changeset, cleaned_opts)
+        end
+    end
+  end
+
+  @doc """
+  Executes a destroy action, handling both single-record and bulk/atomic destroy operations.
+
+  This function is called at runtime by generated code interface functions. It handles:
+  - Single record destruction via `Ash.destroy/2` or `Ash.destroy!/2`
+  - Bulk destruction via `Ash.bulk_destroy/4` or `Ash.bulk_destroy!/4`
+  - Atomic operations with method detection (:id, :query, :stream)
+  - Return destroyed record handling based on `:return_destroyed?` option
+  - Error handling based on `raise_on_error?` flag
+
+  ## Parameters
+  - `changeset` - Either an `%Ash.Changeset{}` or `{:atomic, method, id}` tuple
+  - `custom_input_errors` - List of custom validation errors
+  - `changeset_opts` - Options for changeset (actor, tenant, authorize?, etc.)
+  - `opts` - Additional options including `:bulk_options`, `:return_destroyed?`, `:return_notifications?`
+  - `params` - Action parameters
+  - `filter_params` - Filter parameters for bulk operations
+  - `resource` - The Ash resource module
+  - `action_name` - Name of the destroy action
+  - `interface_get` - Whether this is a get? operation (expects single record)
+  - `module` - Module for data layer capabilities check
+  - `raise_on_error?` - If true, raises on error; if false, returns tuples
+
+  ## Returns
+  - When `raise_on_error?` is false: `:ok`, `{:ok, record}`, `{:ok, notifications}`, `{:error, error}`, or `%Ash.BulkResult{}`
+  - When `raise_on_error?` is true: `:ok`, `record`, `notifications`, `%Ash.BulkResult{}`, or raises exception
+  """
+  def execute_destroy_action(
+        changeset,
+        custom_input_errors,
+        changeset_opts,
+        opts,
+        params,
+        filter_params,
+        resource,
+        action_name,
+        interface_get,
+        module,
+        raise_on_error?
+      ) do
+    case changeset do
+      {:atomic, method, id} ->
+        if Enum.any?(custom_input_errors) do
+          if raise_on_error? do
+            raise Ash.Error.to_error_class(custom_input_errors)
+          else
+            %Ash.BulkResult{
+              errors: [Ash.Error.to_error_class(custom_input_errors)],
+              error_count: 1
+            }
+          end
+        else
+          bulk_opts =
+            opts
+            |> Keyword.drop([:bulk_options, :return_destroyed?])
+            |> Keyword.merge(Keyword.get(opts, :bulk_options, []))
+            |> Enum.concat(changeset_opts)
+            |> Keyword.put(:resource, resource)
+            |> then(fn bulk_opts ->
+              if method == :id || interface_get do
+                authorize_with =
+                  if Ash.DataLayer.data_layer_can?(module, :expr_error) do
+                    :error
+                  else
+                    :filter
+                  end
+
+                bulk_opts
+                |> Keyword.put(:return_records?, true)
+                |> Keyword.put(:return_errors?, true)
+                |> Keyword.put(:allow_stream_with, @stream_with_full_read)
+                |> Keyword.put_new(:authorize_with, authorize_with)
+                |> Keyword.merge(@notify_true)
+              else
+                Keyword.put(bulk_opts, :return_records?, opts[:return_destroyed?])
+              end
+            end)
+            |> Keyword.put_new(:strategy, @atomic_strategies)
+
+          bulk_opts =
+            if method in [:stream, :query] do
+              Keyword.put(bulk_opts, :filter, filter_params)
+            else
+              bulk_opts
+            end
+
+          case bulk_query(resource, method, id) do
+            {:ok, query} ->
+              result =
+                if raise_on_error? do
+                  Ash.bulk_destroy!(query, action_name, params, bulk_opts)
+                else
+                  Ash.bulk_destroy(query, action_name, params, bulk_opts)
+                end
+
+              case result do
+                %Ash.BulkResult{} = result
+                when method in [:stream, :query] and not interface_get ->
+                  result
+
+                %Ash.BulkResult{status: :success, records: [_, _ | _] = records}
+                when interface_get ->
+                  error =
+                    Ash.Error.Invalid.MultipleResults.exception(
+                      count: Enum.count(records),
+                      query: query
+                    )
+
+                  if raise_on_error? do
+                    raise Ash.Error.to_error_class(error)
+                  else
+                    {:error, error}
+                  end
+
+                %Ash.BulkResult{status: :success, records: [record]} = result ->
+                  if opts[:return_destroyed?] do
+                    if raise_on_error? do
+                      if opts[:return_notifications?] do
+                        {record, result.notifications}
+                      else
+                        record
+                      end
+                    else
+                      if opts[:return_notifications?] do
+                        {:ok, record, result.notifications}
+                      else
+                        {:ok, record}
+                      end
+                    end
+                  else
+                    if raise_on_error? do
+                      if opts[:return_notifications?] do
+                        result.notifications
+                      else
+                        :ok
+                      end
+                    else
+                      if opts[:return_notifications?] do
+                        {:ok, result.notifications}
+                      else
+                        :ok
+                      end
+                    end
+                  end
+
+                %Ash.BulkResult{status: :success, records: empty}
+                when empty in [[], nil] and (interface_get or method == :id) ->
+                  error =
+                    Ash.Error.Query.NotFound.exception(
+                      resource: resource,
+                      primary_key: id
+                    )
+
+                  if raise_on_error? do
+                    raise Ash.Error.to_error_class(error)
+                  else
+                    {:error, Ash.Error.to_error_class(error)}
+                  end
+
+                %Ash.BulkResult{status: :success, records: empty}
+                when empty in [[], nil] ->
+                  if opts[:return_destroyed?] do
+                    error =
+                      Ash.Error.Query.NotFound.exception(
+                        resource: resource,
+                        primary_key: id
+                      )
+
+                    if raise_on_error? do
+                      raise Ash.Error.to_error_class(error)
+                    else
+                      {:error, Ash.Error.to_error_class(error)}
+                    end
+                  else
+                    if raise_on_error? do
+                      if opts[:return_notifications?] do
+                        result.notifications
+                      else
+                        :ok
+                      end
+                    else
+                      if opts[:return_notifications?] do
+                        {:ok, result.notifications}
+                      else
+                        :ok
+                      end
+                    end
+                  end
+
+                %Ash.BulkResult{status: :error, errors: errors} ->
+                  if raise_on_error? do
+                    raise Ash.Error.to_error_class(errors)
+                  else
+                    {:error, Ash.Error.to_error_class(errors)}
+                  end
+              end
+
+            {:error, error} ->
+              if raise_on_error? do
+                raise Ash.Error.to_error_class(error)
+              else
+                {:error, Ash.Error.to_error_class(error)}
+              end
+          end
+        end
+
+      changeset ->
+        cleaned_opts = Keyword.delete(opts, :bulk_options)
+
+        if raise_on_error? do
+          Ash.destroy!(changeset, cleaned_opts)
+        else
+          Ash.destroy(changeset, cleaned_opts)
+        end
+    end
+  end
+
+  @doc """
+  Executes an update action, handling both single-record and bulk/atomic update operations.
+
+  This function is called at runtime by generated code interface functions. It handles:
+  - Single record updates via `Ash.update/2` or `Ash.update!/2`
+  - Bulk updates via `Ash.bulk_update/4` or `Ash.bulk_update!/4`
+  - Atomic operations with method detection (:id, :query, :stream)
+  - Result extraction for get? operations
+  - Notification handling with `:return_notifications?` option
+  - Error handling based on `raise_on_error?` flag
+
+  ## Parameters
+  - `changeset` - Either an `%Ash.Changeset{}` or `{:atomic, method, id}` tuple
+  - `custom_input_errors` - List of custom validation errors
+  - `changeset_opts` - Options for changeset (actor, tenant, authorize?, etc.)
+  - `opts` - Additional options including `:bulk_options`, `:return_notifications?`
+  - `params` - Action parameters to update
+  - `filter_params` - Filter parameters for bulk operations
+  - `resource` - The Ash resource module
+  - `action_name` - Name of the update action
+  - `interface_get` - Whether this is a get? operation (expects single record)
+  - `module` - Module for data layer capabilities check
+  - `raise_on_error?` - If true, raises on error; if false, returns tuples
+
+  ## Returns
+  - When `raise_on_error?` is false: `{:ok, record}`, `{:ok, record, notifications}`, `{:error, error}`, or `%Ash.BulkResult{}`
+  - When `raise_on_error?` is true: `record`, `{record, notifications}`, `%Ash.BulkResult{}`, or raises exception
+  """
+  def execute_update_action(
+        changeset,
+        custom_input_errors,
+        changeset_opts,
+        opts,
+        params,
+        filter_params,
+        resource,
+        action_name,
+        interface_get,
+        module,
+        raise_on_error?
+      ) do
+    case changeset do
+      {:atomic, method, id} ->
+        if Enum.any?(custom_input_errors) do
+          if raise_on_error? do
+            raise Ash.Error.to_error_class(custom_input_errors)
+          else
+            %Ash.BulkResult{
+              errors: [Ash.Error.to_error_class(custom_input_errors)],
+              error_count: 1
+            }
+          end
+        else
+          bulk_opts =
+            opts
+            |> Keyword.drop([:bulk_options, :atomic_upgrade?])
+            |> Keyword.merge(Keyword.get(opts, :bulk_options, []))
+            |> Enum.concat(changeset_opts)
+            |> Keyword.put(:resource, resource)
+            |> then(fn bulk_opts ->
+              if method == :id || interface_get do
+                authorize_with =
+                  if Ash.DataLayer.data_layer_can?(module, :expr_error) do
+                    :error
+                  else
+                    :filter
+                  end
+
+                bulk_opts
+                |> Keyword.put(:return_records?, true)
+                |> Keyword.put(:return_errors?, true)
+                |> then(fn opts ->
+                  if raise_on_error? do
+                    Keyword.put(opts, :allow_stream_with, @stream_with_full_read)
+                  else
+                    opts
+                  end
+                end)
+                |> Keyword.put_new(:authorize_with, authorize_with)
+                |> Keyword.merge(@notify_true)
+              else
+                bulk_opts
+              end
+            end)
+            |> Keyword.put_new(:strategy, @atomic_strategies)
+
+          bulk_opts =
+            if method in [:stream, :query] do
+              Keyword.put(bulk_opts, :filter, filter_params)
+            else
+              bulk_opts
+            end
+
+          case bulk_query(resource, method, id) do
+            {:ok, query} ->
+              result =
+                if raise_on_error? do
+                  Ash.bulk_update!(query, action_name, params, bulk_opts)
+                else
+                  Ash.bulk_update(query, action_name, params, bulk_opts)
+                end
+
+              case result do
+                %Ash.BulkResult{} = result
+                when method in [:stream, :query] and not interface_get ->
+                  result
+
+                %Ash.BulkResult{status: :success, records: [_, _ | _] = records}
+                when interface_get ->
+                  error =
+                    Ash.Error.Invalid.MultipleResults.exception(
+                      count: Enum.count(records),
+                      query: query
+                    )
+
+                  if raise_on_error? do
+                    raise Ash.Error.to_error_class(error)
+                  else
+                    {:error, error}
+                  end
+
+                %Ash.BulkResult{status: :success, records: [record]} = result ->
+                  if raise_on_error? do
+                    if opts[:return_notifications?] do
+                      {record, result.notifications}
+                    else
+                      record
+                    end
+                  else
+                    if opts[:return_notifications?] do
+                      {:ok, record, result.notifications}
+                    else
+                      {:ok, record}
+                    end
+                  end
+
+                %Ash.BulkResult{status: :success, records: []} ->
+                  error =
+                    Ash.Error.Query.NotFound.exception(
+                      resource: resource,
+                      primary_key: id
+                    )
+
+                  if raise_on_error? do
+                    raise Ash.Error.to_error_class(error)
+                  else
+                    {:error, Ash.Error.to_error_class(error)}
+                  end
+
+                %Ash.BulkResult{status: :error, errors: errors} ->
+                  if raise_on_error? do
+                    raise Ash.Error.to_error_class(errors)
+                  else
+                    {:error, Ash.Error.to_error_class(errors)}
+                  end
+              end
+
+            {:error, error} ->
+              if raise_on_error? do
+                raise Ash.Error.to_error_class(error)
+              else
+                {:error, Ash.Error.to_error_class(error)}
+              end
+          end
+        end
+
+      changeset ->
+        cleaned_opts = Keyword.delete(opts, :bulk_options)
+
+        if raise_on_error? do
+          Ash.update!(changeset, cleaned_opts)
+        else
+          Ash.update(changeset, cleaned_opts)
+        end
+    end
+  end
+
   @doc false
   # sobelow_skip ["DOS.BinToAtom", "DOS.StringToAtom"]
   def resolve_calc_method_names(name) do
