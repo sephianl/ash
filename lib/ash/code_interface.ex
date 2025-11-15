@@ -1123,6 +1123,205 @@ defmodule Ash.CodeInterface do
     end
   end
 
+  @doc """
+  Executes a calculation, handling both bang and non-bang variants.
+
+  This function is called at runtime by generated code interface calculation functions.
+  It consolidates the logic for both safe and bang calculation functions, eliminating
+  duplication between the two variants.
+
+  ## Parameters
+  - `resource` - The Ash resource module
+  - `domain` - The Ash domain module
+  - `calculation_name` - Name of the calculation to execute
+  - `refs` - Referenced calculations (from process_calc_args)
+  - `arguments` - Calculation arguments (from process_calc_args)
+  - `record` - Optional record to calculate on (from process_calc_args)
+  - `custom_input_errors` - List of custom validation errors (from process_calc_args)
+  - `opts` - Additional calculation options
+  - `raise_on_error?` - If true, raises on errors; if false, returns {:error, error}
+
+  ## Returns
+  - When `raise_on_error?` is `true`: Returns result or raises on error
+  - When `raise_on_error?` is `false`: Returns `result` or `{:error, error}`
+
+  ## Example
+  ```elixir
+  # Bang version (raises on error)
+  Ash.CodeInterface.execute_calculation(
+    MyResource, MyDomain, :calculate_total,
+    refs, args, record, errors, opts, true
+  )
+
+  # Safe version (returns {:error, error})
+  Ash.CodeInterface.execute_calculation(
+    MyResource, MyDomain, :calculate_total,
+    refs, args, record, errors, opts, false
+  )
+  ```
+  """
+  def execute_calculation(
+        resource,
+        domain,
+        calculation_name,
+        refs,
+        arguments,
+        record,
+        custom_input_errors,
+        opts,
+        raise_on_error?
+      ) do
+    case custom_input_errors do
+      [] ->
+        calc_opts = [domain: domain, refs: refs, args: arguments, record: record] ++ opts
+
+        if raise_on_error? do
+          Ash.calculate!(resource, calculation_name, calc_opts)
+        else
+          Ash.calculate(resource, calculation_name, calc_opts)
+        end
+
+      errors ->
+        if raise_on_error? do
+          raise Ash.Error.to_error_class(errors)
+        else
+          {:error, Ash.Error.to_error_class(errors)}
+        end
+    end
+  end
+
+  @doc false
+  def process_calc_args(
+        arg_access,
+        opts,
+        exclude_inputs,
+        custom_inputs,
+        resource,
+        interface_calculation,
+        arg_bindings_count
+      ) do
+    {refs, arguments, record} =
+      Enum.reduce(
+        arg_access,
+        {opts[:refs] || %{}, opts[:args] || %{}, nil},
+        fn config, {refs, arguments, record} ->
+          case config[:type] do
+            :_record ->
+              {refs, arguments, config[:value]}
+
+            :both ->
+              {Map.put(refs, config[:name], config[:value]),
+               Map.put(arguments, config[:name], config[:value]), record}
+
+            :ref ->
+              {Map.put(refs, config[:name], config[:value]), arguments, record}
+
+            :arg ->
+              {refs, Map.put(arguments, config[:name], config[:value]), record}
+          end
+        end
+      )
+
+    case Enum.filter(exclude_inputs, fn input ->
+           Map.has_key?(arguments, input) || Map.has_key?(arguments, to_string(input))
+         end) do
+      [] ->
+        :ok
+
+      inputs ->
+        raise ArgumentError,
+              "Input(s) `#{Enum.join(inputs, ", ")}` not accepted by #{inspect(resource)}.#{interface_calculation}/#{arg_bindings_count + 1}"
+    end
+
+    {arguments, custom_input_errors} =
+      handle_custom_inputs(
+        arguments,
+        custom_inputs,
+        resource
+      )
+
+    {refs, arguments, record, custom_input_errors}
+  end
+
+  @doc false
+  def resolve_params_opts_and_filters(
+        params_or_opts,
+        opts,
+        default_options,
+        interface_options,
+        arg_params,
+        exclude_inputs,
+        custom_inputs,
+        resource,
+        interface_name,
+        interface_arity,
+        filter_params
+      ) do
+    {params, opts} =
+      params_and_opts(
+        params_or_opts,
+        opts,
+        fn opts ->
+          default_opts =
+            case default_options do
+              fun when is_function(fun, 0) -> fun.()
+              static_options -> static_options
+            end
+
+          opts
+          |> merge_default_opts(default_opts)
+          |> interface_options.validate!()
+          |> interface_options.to_options()
+        end
+      )
+
+    params =
+      if is_list(params) do
+        Enum.map(params, fn item ->
+          if is_map(item) do
+            Map.merge(item, arg_params)
+          else
+            raise ArgumentError, """
+            Expected `params` to be a map or a list of maps.
+            Got:  #{inspect(params)}
+            """
+          end
+        end)
+      else
+        if is_map(params) do
+          Map.merge(params, arg_params)
+        else
+          raise ArgumentError, """
+          Expected `params` to be a map or a list of maps.
+          Got:  #{inspect(params)}
+          """
+        end
+      end
+
+    case Enum.filter(exclude_inputs, fn input ->
+           if is_list(params) do
+             Enum.any?(
+               params,
+               &(Map.has_key?(&1, input) || Map.has_key?(&1, to_string(input)))
+             )
+           else
+             Map.has_key?(params, input) || Map.has_key?(params, to_string(input))
+           end
+         end) do
+      [] ->
+        :ok
+
+      inputs ->
+        raise ArgumentError,
+              "Input(s) `#{Enum.join(inputs, ", ")}` not accepted by #{inspect(resource)}.#{interface_name}/#{interface_arity}"
+    end
+
+    {params, custom_input_errors} =
+      handle_custom_inputs(params, custom_inputs, resource)
+
+    {params, custom_input_errors, opts, filter_params}
+  end
+
   @doc false
   # sobelow_skip ["DOS.BinToAtom", "DOS.StringToAtom"]
   def resolve_calc_method_names(name) do
