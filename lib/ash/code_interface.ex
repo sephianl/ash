@@ -404,6 +404,263 @@ defmodule Ash.CodeInterface do
     {query, opts}
   end
 
+  @doc """
+  Resolves the subject (Changeset or bulk tuple) for a create action.
+
+  Handles changeset building and bulk operation detection based on params type.
+
+  ## Parameters
+  - `changeset_input` - Map with `:opts` key containing keyword list
+  - `params` - Either a map (single create) or list (bulk create)
+  - `custom_input_errors` - Accumulated custom validation errors
+  - `resource` - The Ash resource module
+  - `domain` - The Ash domain module
+  - `action_name` - Name of the create action
+
+  ## Returns
+  `{changeset, changeset_opts, opts}` where:
+  - `changeset` is an `%Ash.Changeset{}` or `{:bulk, inputs}` tuple
+  - `changeset_opts` are changeset-specific options (actor, tenant, etc.)
+  - `opts` is remaining options after extraction
+  """
+  def resolve_action_subject_for_create(
+        changeset_input,
+        params,
+        custom_input_errors,
+        resource,
+        domain,
+        action_name
+      ) do
+    {changeset_val, opts} = Keyword.pop(changeset_input[:opts] || [], :changeset)
+
+    {changeset_opts, opts} =
+      Keyword.split(opts, [
+        :actor,
+        :tenant,
+        :scope,
+        :authorize?,
+        :tracer,
+        :context,
+        :skip_unknown_inputs,
+        :private_arguments
+      ])
+
+    changeset_opts = Keyword.put(changeset_opts, :domain, domain)
+
+    changeset =
+      if is_map(params) do
+        changeset_val
+        |> Kernel.||(resource)
+        |> case do
+          %Ash.Changeset{resource: ^resource} ->
+            changeset_val
+
+          %Ash.Changeset{resource: _other_resource} ->
+            raise ArgumentError,
+                  "Changeset #{inspect(changeset_val)} does not match expected resource #{inspect(resource)}."
+
+          other_resource
+          when is_atom(other_resource) and other_resource != resource ->
+            raise ArgumentError,
+                  "Resource #{inspect(other_resource)} does not match expected resource #{inspect(resource)}."
+
+          changeset ->
+            changeset
+        end
+        |> Ash.Changeset.new()
+        |> Ash.Changeset.add_error(custom_input_errors)
+        |> Ash.Changeset.for_create(action_name, params, changeset_opts)
+      else
+        {:bulk, params}
+      end
+
+    {changeset, changeset_opts, opts}
+  end
+
+  @doc """
+  Resolves the subject (Changeset or atomic tuple) for an update action.
+
+  Handles both single-record updates and bulk/atomic operations based on input type.
+
+  ## Parameters
+  - `record_input` - Map with `:opts` and optional `:record` keys
+  - `params` - Update parameters
+  - `custom_input_errors` - Accumulated custom validation errors
+  - `filter_params` - Filter parameters for atomic operations
+  - `resource` - The Ash resource module
+  - `domain` - The Ash domain module
+  - `action_name` - Name of the update action
+  - `require_reference?` - Whether a record reference is required
+  - `filter_keys` - List of filter keys
+
+  ## Returns
+  `{changeset, changeset_opts, opts}` where:
+  - `changeset` is an `%Ash.Changeset{}` or `{:atomic, method, id}` tuple
+  - `changeset_opts` are changeset-specific options
+  - `opts` is remaining options after extraction
+  """
+  def resolve_action_subject_for_update(
+        record_input,
+        params,
+        custom_input_errors,
+        filter_params,
+        resource,
+        domain,
+        action_name,
+        require_reference?,
+        filter_keys
+      ) do
+    {changeset_opts, opts} =
+      Keyword.split(record_input[:opts] || [], [
+        :actor,
+        :tenant,
+        :scope,
+        :authorize?,
+        :tracer,
+        :context,
+        :skip_unknown_inputs,
+        :private_arguments
+      ])
+
+    changeset_opts = Keyword.put(changeset_opts, :domain, domain)
+
+    changeset =
+      if Enum.empty?(filter_keys) and require_reference? do
+        record = record_input[:record]
+
+        record
+        |> case do
+          %Ash.Changeset{resource: ^resource} ->
+            record
+            |> Ash.Changeset.filter(filter_params)
+            |> Ash.Changeset.add_error(custom_input_errors)
+            |> Ash.Changeset.for_update(action_name, params, changeset_opts)
+
+          %Ash.Changeset{resource: _other_resource} ->
+            raise ArgumentError,
+                  "Changeset #{inspect(record)} does not match expected resource #{inspect(resource)}."
+
+          %struct{} = record when struct == resource ->
+            record
+            |> Ash.Changeset.new()
+            |> Ash.Changeset.filter(filter_params)
+            |> Ash.Changeset.add_error(custom_input_errors)
+            |> Ash.Changeset.for_update(action_name, params, changeset_opts)
+
+          %Ash.Query{} = query ->
+            {:atomic, :query, query}
+
+          %other_resource{} when other_resource != resource ->
+            raise ArgumentError,
+                  "Record #{inspect(record)} does not match expected resource #{inspect(resource)}."
+
+          [{_key, _val} | _] = id ->
+            {:atomic, :id, id}
+
+          list when is_list(list) ->
+            {:atomic, :stream, list}
+
+          other ->
+            {:atomic, :id, other}
+        end
+      else
+        {:atomic, :query, Ash.Query.do_filter(resource, filter_params)}
+      end
+
+    {changeset, changeset_opts, opts}
+  end
+
+  @doc """
+  Resolves the subject (Changeset or atomic tuple) for a destroy action.
+
+  Handles both single-record destruction and bulk/atomic operations.
+
+  ## Parameters
+  - `record_input` - Map with `:opts` and optional `:record` keys
+  - `params` - Destroy parameters
+  - `custom_input_errors` - Accumulated custom validation errors
+  - `filter_params` - Filter parameters for atomic operations
+  - `resource` - The Ash resource module
+  - `domain` - The Ash domain module
+  - `action_name` - Name of the destroy action
+  - `require_reference?` - Whether a record reference is required
+
+  ## Returns
+  `{changeset, changeset_opts, opts}` where:
+  - `changeset` is an `%Ash.Changeset{}` or `{:atomic, method, id}` tuple
+  - `changeset_opts` are changeset-specific options
+  - `opts` is remaining options after extraction
+  """
+  def resolve_action_subject_for_destroy(
+        record_input,
+        params,
+        custom_input_errors,
+        filter_params,
+        resource,
+        domain,
+        action_name,
+        require_reference?
+      ) do
+    {changeset_opts, opts} =
+      Keyword.split(record_input[:opts] || [], [
+        :actor,
+        :tenant,
+        :scope,
+        :authorize?,
+        :tracer,
+        :context,
+        :skip_unknown_inputs,
+        :private_arguments
+      ])
+
+    changeset_opts = Keyword.put(changeset_opts, :domain, domain)
+
+    changeset =
+      if require_reference? do
+        record = record_input[:record]
+
+        record
+        |> case do
+          %Ash.Changeset{resource: ^resource} ->
+            record
+            |> Ash.Changeset.filter(filter_params)
+            |> Ash.Changeset.add_error(custom_input_errors)
+            |> Ash.Changeset.for_destroy(action_name, params, changeset_opts)
+
+          %Ash.Changeset{resource: _other_resource} ->
+            raise ArgumentError,
+                  "Changeset #{inspect(record)} does not match expected resource #{inspect(resource)}."
+
+          %struct{} = record when struct == resource ->
+            record
+            |> Ash.Changeset.new()
+            |> Ash.Changeset.filter(filter_params)
+            |> Ash.Changeset.add_error(custom_input_errors)
+            |> Ash.Changeset.for_destroy(action_name, params, changeset_opts)
+
+          %Ash.Query{} = query ->
+            {:atomic, :query, query}
+
+          %other_resource{} when other_resource != resource ->
+            raise ArgumentError,
+                  "Record #{inspect(record)} does not match expected resource #{inspect(resource)}."
+
+          [{_key, _val} | _] = id ->
+            {:atomic, :id, id}
+
+          list when is_list(list) ->
+            {:atomic, :stream, list}
+
+          other ->
+            {:atomic, :id, other}
+        end
+      else
+        {:atomic, :query, Ash.Query.do_filter(resource, filter_params)}
+      end
+
+    {changeset, changeset_opts, opts}
+  end
+
   @doc false
   # sobelow_skip ["DOS.BinToAtom", "DOS.StringToAtom"]
   def resolve_calc_method_names(name) do
