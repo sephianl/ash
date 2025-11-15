@@ -7,6 +7,12 @@ defmodule Ash.CodeInterface do
   Used to define the functions of a code interface for a resource.
   """
 
+  # Compile-time optimization: Common literal values
+  @stream_with_full_read :full_read
+  @atomic_strategies [:atomic, :stream, :atomic_batches]
+  @notify_true [notify?: true]
+  @atomic_can_opts [:tenant, :authorize?, :tracer, :context, :skip_unknown_inputs]
+
   @doc false
   def require_action(resource, interface) do
     action = Ash.Resource.Info.action(resource, interface.action || interface.name)
